@@ -1,10 +1,47 @@
 from pathlib import Path
+import re
 
 from langchain_core.documents import Document
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_core.embeddings import Embeddings
 from langchain_postgres import PGVector
 
-from assistente_corporativo.config import settings
+from assistente_corporativo.config import (
+    DEFAULT_EMBEDDING_MODELS,
+    VALID_EMBEDDING_PROVIDERS,
+    settings,
+)
+
+
+def _slugify(value: str) -> str:
+    cleaned = value.strip().lower().removeprefix("models/")
+    return re.sub(r"[^a-z0-9]+", "_", cleaned).strip("_")
+
+
+def resolve_collection_name(
+    collection_name: str | None = None,
+    embedding_provider: str | None = None,
+    embedding_model: str | None = None,
+) -> str:
+    """Resolve o nome da coleção separada por provedor e modelo de embedding.
+
+    Se `collection_name` for passado explicitamente, usa esse nome.
+    Caso contrário, gera `<COLLECTION_NAME>__<provider>__<model>` para que
+    múltiplos modelos (com dimensões diferentes) coexistam no PostgreSQL sem
+    conflito nem necessidade de reindexar ao alternar de provedor.
+    """
+    if collection_name:
+        return collection_name
+
+    provider = (embedding_provider or settings.embedding_provider).strip().lower()
+    model = (
+        embedding_model
+        or (
+            settings.embedding_model
+            if provider == settings.embedding_provider
+            else DEFAULT_EMBEDDING_MODELS[provider]
+        )
+    )
+    return f"{settings.collection_name}__{_slugify(provider)}__{_slugify(model)}"
 
 
 def load_chunks(chunks_dir: Path | None = None) -> list[Document]:
@@ -43,24 +80,69 @@ def load_chunks(chunks_dir: Path | None = None) -> list[Document]:
     return documents
 
 
-def get_embeddings(model: str | None = None) -> GoogleGenerativeAIEmbeddings:
-    """Instancia o modelo de embeddings do Google Gemini."""
-    return GoogleGenerativeAIEmbeddings(
-        model=model or settings.embedding_model,
-        google_api_key=settings.google_api_key,
+def get_embeddings(
+    provider: str | None = None,
+    model: str | None = None,
+) -> Embeddings:
+    """Factory do modelo de embeddings: padrão 'ollama', alternativa 'gemini'."""
+    selected_provider = (provider or settings.embedding_provider).strip().lower()
+    if selected_provider not in VALID_EMBEDDING_PROVIDERS:
+        raise ValueError(
+            f"Provedor de embeddings inválido: '{selected_provider}'. "
+            f"Use um de: {', '.join(VALID_EMBEDDING_PROVIDERS)}."
+        )
+
+    selected_model = (
+        model
+        or (
+            settings.embedding_model
+            if selected_provider == settings.embedding_provider
+            else DEFAULT_EMBEDDING_MODELS[selected_provider]
+        )
     )
+
+    if selected_provider == "ollama":
+        from langchain_ollama import OllamaEmbeddings
+
+        return OllamaEmbeddings(
+            model=selected_model,
+            base_url=settings.ollama_base_url,
+        )
+
+    if selected_provider == "gemini":
+        if not settings.google_api_key:
+            raise ValueError(
+                "GOOGLE_API_KEY não configurada no .env para usar embeddings do Gemini."
+            )
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+        return GoogleGenerativeAIEmbeddings(
+            model=selected_model,
+            google_api_key=settings.google_api_key,
+        )
+
+    raise ValueError(f"Provedor de embeddings não suportado: '{selected_provider}'.")
 
 
 def get_vector_store(
     collection_name: str | None = None,
+    embedding_provider: str | None = None,
     embedding_model: str | None = None,
     pre_delete_collection: bool = False,
 ) -> PGVector:
     """Retorna a instância do banco vetorial PGVector conectada ao PostgreSQL."""
-    embeddings = get_embeddings(model=embedding_model)
+    embeddings = get_embeddings(
+        provider=embedding_provider,
+        model=embedding_model,
+    )
+    resolved_collection = resolve_collection_name(
+        collection_name=collection_name,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
+    )
     return PGVector(
         embeddings=embeddings,
-        collection_name=collection_name or settings.collection_name,
+        collection_name=resolved_collection,
         connection=settings.database_url,
         use_jsonb=True,
         pre_delete_collection=pre_delete_collection,
@@ -70,25 +152,41 @@ def get_vector_store(
 def index_chunks(
     chunks_dir: Path | None = None,
     collection_name: str | None = None,
+    embedding_provider: str | None = None,
     embedding_model: str | None = None,
 ) -> PGVector:
     """Indexa todos os chunks no PGVector de forma idempotente."""
     documents = load_chunks(chunks_dir=chunks_dir)
-    target_collection = collection_name or settings.collection_name
-    target_model = embedding_model or settings.embedding_model
+    target_provider = (embedding_provider or settings.embedding_provider).strip().lower()
+    target_model = (
+        embedding_model
+        or (
+            settings.embedding_model
+            if target_provider == settings.embedding_provider
+            else DEFAULT_EMBEDDING_MODELS[target_provider]
+        )
+    )
+    target_collection = resolve_collection_name(
+        collection_name=collection_name,
+        embedding_provider=target_provider,
+        embedding_model=target_model,
+    )
 
     vector_store = get_vector_store(
         collection_name=target_collection,
+        embedding_provider=target_provider,
         embedding_model=target_model,
         pre_delete_collection=True,
     )
 
-    ids = [doc.metadata["chunk_id"] for doc in documents]
+    # Prefixa o ID com o nome da coleção para evitar colisão de chave primária
+    # entre coleções diferentes na tabela langchain_pg_embedding.
+    ids = [f"{target_collection}:{doc.metadata['chunk_id']}" for doc in documents]
     vector_store.add_documents(documents, ids=ids)
 
     print(
         f"Indexação concluída: {len(documents)} chunks salvos na coleção "
-        f"'{target_collection}' usando '{target_model}'."
+        f"'{target_collection}' usando {target_provider} ('{target_model}')."
     )
     return vector_store
 
